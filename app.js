@@ -83,6 +83,8 @@
     whEditCode: null,
     whConfirmDelete: null,
     fulfillConfirmCancel: null,
+    fulfillDrafts: {},
+    myReqConfirmCancel: null,
     stockCountCategory: 'ทั้งหมด',
     stockCountSearch: '',
     stockCountNotes: '',
@@ -651,8 +653,10 @@
     app.appendChild(el('p', { class: 'subtitle' }, [txt('Bangkok Hospital Samui')]));
 
     const pendingCountForTab = history.filter(h => h.type === 'เบิกของ' && h.status === 'pending').length;
+    const myPendingCountForTab = history.filter(h => h.type === 'เบิกของ' && h.status === 'pending' && h.recordedBy === session.username).length;
     const tabsDef = [
-      ['transact', '📦 เบิก/เติมสต๊อก']
+      ['transact', '📦 เบิก/เติมสต๊อก'],
+      ['myRequests', '🧾 คำขอของฉัน' + (myPendingCountForTab ? ` (${myPendingCountForTab})` : '')]
     ];
     if (isAdmin()) tabsDef.push(['fulfillment', '📋 สรุปรายการเบิก' + (pendingCountForTab ? ` (${pendingCountForTab})` : '')]);
     tabsDef.push(
@@ -677,7 +681,7 @@
       app.appendChild(el('div', { class: 'banner' }, [txt('⚠️ ยังไม่ได้เชื่อมต่อฐานข้อมูล (Google Sheet) — กรุณาตั้งค่า API_URL ในไฟล์ config.js ตามคำแนะนำใน README.md ตอนนี้ข้อมูลจะไม่ถูกบันทึกถาวรและใช้ได้เฉพาะเครื่องนี้เท่านั้น')]));
     }
 
-    const map = { transact: renderTransact, fulfillment: renderFulfillment, warehouse: renderWarehouse, stockCount: renderStockCount, reportLuxury: renderReportLuxury, reportWithdraw: renderReportWithdraw, reportRestock: renderReportRestock, reportDept: renderReportDept, history: renderHistory, users: renderUsers };
+    const map = { transact: renderTransact, myRequests: renderMyRequests, fulfillment: renderFulfillment, warehouse: renderWarehouse, stockCount: renderStockCount, reportLuxury: renderReportLuxury, reportWithdraw: renderReportWithdraw, reportRestock: renderReportRestock, reportDept: renderReportDept, history: renderHistory, users: renderUsers };
     const fn = map[state.tab] || renderTransact;
     const adminOnlyTabs = ['users', 'fulfillment', 'stockCount'];
     if (adminOnlyTabs.indexOf(state.tab) !== -1 && !isAdmin()) { state.tab = 'transact'; renderTransact(app); }
@@ -865,45 +869,60 @@
       .sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime()); // oldest first (queue order)
   }
 
+  // A "draft" is the editable working copy of a pending order's line items
+  // that the admin sees in the Fulfillment tab — separate from the order's
+  // saved `items` so adding/removing/swapping products doesn't touch the
+  // database until "ยืนยันปล่อยของ" is pressed.
+  function fulfillDraftFor_(req) {
+    if (!state.fulfillDrafts[req.id]) {
+      state.fulfillDrafts[req.id] = (req.items || []).map(it => ({ code: it.code, qty: it.qty }));
+    }
+    return state.fulfillDrafts[req.id];
+  }
+
   async function releaseRequisition(reqId) {
     const req = history.find(h => h.id === reqId);
     if (!req) return;
-    const rows = document.querySelectorAll(`[data-fulfill-row="${reqId}"]`);
+    const draft = state.fulfillDrafts[reqId] || [];
     const updatedItems = [];
-    let shortfall = null;
-    rows.forEach(row => {
-      const code = row.getAttribute('data-code');
-      const input = row.querySelector('input');
-      const qty = Math.max(0, parseFloat(input.value) || 0);
-      const orig = (req.items || []).find(it => it.code === code);
-      const product = products.find(p => p.code === code);
-      const availableStock = product ? product.stock : 0;
-      if (qty > availableStock && !shortfall) shortfall = { name: orig.name, available: availableStock };
-      updatedItems.push({ ...orig, qty, subtotal: Math.round(qty * orig.price * 100) / 100 });
+    const stockUsed = {};
+    let error = null;
+    draft.forEach(entry => {
+      if (error || !entry.code) return;
+      const qty = Math.max(0, parseFloat(entry.qty) || 0);
+      if (qty <= 0) return;
+      const product = products.find(p => p.code === entry.code);
+      if (!product) { error = 'พบรายการสินค้าที่เลือกไม่ถูกต้อง กรุณาเลือกใหม่'; return; }
+      const already = stockUsed[entry.code] || 0;
+      const remaining = product.stock - already;
+      if (qty > remaining) { error = `${product.name}: คงเหลือไม่พอ (เหลือ ${fmt(remaining)}) กรุณาปรับจำนวนหรือเติมสต๊อกก่อน`; return; }
+      stockUsed[entry.code] = already + qty;
+      updatedItems.push({ code: product.code, name: product.name, category: product.category, unit: product.unit, price: product.price, qty, subtotal: Math.round(qty * product.price * 100) / 100 });
     });
-    if (shortfall) { showToast(`${shortfall.name}: คงเหลือไม่พอ (เหลือ ${fmt(shortfall.available)}) กรุณาปรับจำนวนหรือเติมสต๊อกก่อน`, true); return; }
+    if (error) { showToast(error, true); return; }
+    if (!updatedItems.length) { showToast('กรุณาเลือกสินค้าและระบุจำนวนอย่างน้อย 1 รายการก่อนปล่อยของ', true); return; }
 
     const newTotal = Math.round(updatedItems.reduce((s, i) => s + i.subtotal, 0) * 100) / 100;
     try {
       if (apiAvailable) {
         for (const it of updatedItems) {
-          if (it.qty <= 0) continue;
           const product = products.find(p => p.code === it.code);
           const newStock = Math.round(((product ? product.stock : 0) - it.qty) * 100) / 100;
           await apiUpdate('products', it.code, { stock: newStock });
         }
         await apiUpdate('requisitions', reqId, {
-          items: updatedItems.filter(it => it.qty > 0), total: newTotal, status: 'fulfilled',
+          items: updatedItems, total: newTotal, status: 'fulfilled',
           fulfilledAt: new Date().toISOString(), fulfilledBy: session.username, fulfilledByName: session.displayName
         });
         await refreshAll_(false);
       } else {
-        updatedItems.forEach(it => { if (it.qty > 0) { const p = products.find(pp => pp.code === it.code); if (p) p.stock = Math.round((p.stock - it.qty) * 100) / 100; } });
+        updatedItems.forEach(it => { const p = products.find(pp => pp.code === it.code); if (p) p.stock = Math.round((p.stock - it.qty) * 100) / 100; });
         const idx = history.findIndex(h => h.id === reqId);
-        if (idx > -1) history[idx] = { ...history[idx], items: updatedItems.filter(it => it.qty > 0), total: newTotal, status: 'fulfilled' };
+        if (idx > -1) history[idx] = { ...history[idx], items: updatedItems, total: newTotal, status: 'fulfilled' };
       }
+      delete state.fulfillDrafts[reqId];
       showToast('ปล่อยของสำเร็จ');
-    } catch (e) { showToast('เกิดข้อผิดพลาด ลองใหม่อีกครั้ง', true); }
+    } catch (e) { console.error(e); showToast('เกิดข้อผิดพลาด ลองใหม่อีกครั้ง — ' + (e && e.message ? e.message : ''), true); }
     render();
   }
 
@@ -917,9 +936,24 @@
         if (idx > -1) history[idx] = { ...history[idx], status: 'cancelled' };
       }
       state.fulfillConfirmCancel = null;
+      state.myReqConfirmCancel = null;
+      delete state.fulfillDrafts[reqId];
       showToast('ยกเลิกคำขอแล้ว');
-    } catch (e) { showToast('ยกเลิกไม่สำเร็จ', true); }
+    } catch (e) { console.error(e); showToast('ยกเลิกไม่สำเร็จ — ' + (e && e.message ? e.message : ''), true); }
     render();
+  }
+
+  function productSelectFor_(entry, onPick) {
+    const select = el('select', {
+      onchange: (e) => { entry.code = e.target.value; if (!entry.qty) entry.qty = 1; if (onPick) onPick(); render(); }
+    });
+    select.appendChild(el('option', { value: '' }, [txt('-- เลือกสินค้า --')]));
+    products.slice().sort((a, b) => a.name.localeCompare(b.name, 'th')).forEach(p => {
+      const o = el('option', { value: p.code }, [txt(p.name + ' (' + p.unit + ')')]);
+      if (p.code === entry.code) o.setAttribute('selected', 'selected');
+      select.appendChild(o);
+    });
+    return select;
   }
 
   function renderFulfillment(app) {
@@ -927,7 +961,7 @@
     const headCard = el('div', { class: 'card' });
     headCard.appendChild(el('div', { style: 'font-weight:800;font-size:.95rem;color:var(--navy);' }, [txt('สรุปรายการเบิก — ตรวจสอบและปล่อยของ')]));
     headCard.appendChild(el('div', { style: 'font-size:.8rem;color:var(--text-dim);margin-top:4px;' }, [
-      txt('รายการที่ผู้เบิกส่งคำขอมา เรียงจากคำขอเก่าสุดก่อน ตรวจนับสินค้าจริงแล้วปรับจำนวนในช่องได้ก่อนกดยืนยัน ระบบจะตัดสต๊อกก็ต่อเมื่อกด "ยืนยันปล่อยของ" เท่านั้น')
+      txt('รายการที่ผู้เบิกส่งคำขอมา เรียงจากคำขอเก่าสุดก่อน ตรวจนับสินค้าจริงแล้วปรับจำนวน เพิ่มรายการ หรือเปลี่ยนรายการสินค้าที่เบิกผิดได้ก่อนกดยืนยัน ระบบจะตัดสต๊อกก็ต่อเมื่อกด "ยืนยันปล่อยของ" เท่านั้น')
     ]));
     app.appendChild(headCard);
 
@@ -937,6 +971,7 @@
     }
 
     list.forEach(req => {
+      const draft = fulfillDraftFor_(req);
       const card = el('div', { class: 'fulfill-card' });
       card.appendChild(el('div', { class: 'fulfill-head' }, [
         el('div', {}, [
@@ -946,25 +981,32 @@
         el('div', { style: 'font-weight:800;color:var(--navy);' }, [txt(fmtMoney(req.total || 0) + ' บาท')])
       ]));
 
+      card.appendChild(el('div', { style: 'font-size:.78rem;color:var(--text-dim);margin:2px 0 2px;' }, [txt('รายการที่ผู้เบิกขอมาเดิม:')]));
+      card.appendChild(el('ul', { style: 'margin:0 0 10px 18px;padding:0;font-size:.82rem;color:var(--text-dim);' },
+        (req.items || []).map(it => el('li', {}, [txt(it.name + ' — ' + fmt(it.qty) + ' ' + it.unit)]))
+      ));
+
       const table = el('table', { class: 'fulfill-items' });
       table.appendChild(el('thead', {}, [el('tr', {}, [
-        el('th', {}, [txt('รายการสินค้า')]), el('th', {}, [txt('ขอเบิก')]), el('th', {}, [txt('คงเหลือปัจจุบัน')]), el('th', {}, [txt('จำนวนที่จะปล่อยจริง')])
+        el('th', {}, [txt('สินค้าที่จะปล่อยจริง')]), el('th', {}, [txt('คงเหลือปัจจุบัน')]), el('th', {}, [txt('จำนวนที่จะปล่อยจริง')]), el('th', {}, [txt('')])
       ])]));
       const tbody = el('tbody');
-      (req.items || []).forEach(it => {
-        const product = products.find(p => p.code === it.code);
+      draft.forEach((entry, idx) => {
+        const product = products.find(p => p.code === entry.code);
         const available = product ? product.stock : 0;
-        const short = available < it.qty;
-        const input = el('input', { type: 'number', min: '0', step: '1', value: Math.min(it.qty, Math.max(available, 0)) });
-        tbody.appendChild(el('tr', { 'data-fulfill-row': req.id, 'data-code': it.code }, [
-          el('td', {}, [txt(it.name)]),
-          el('td', {}, [txt(fmt(it.qty) + ' ' + it.unit)]),
-          el('td', { class: short ? 'short' : '' }, [txt(fmt(available) + ' ' + it.unit)]),
-          el('td', {}, [input])
+        const short = product && entry.qty > available;
+        const qtyInput = el('input', { type: 'number', min: '0', step: '1', value: entry.qty, oninput: (e) => { entry.qty = parseFloat(e.target.value) || 0; } });
+        tbody.appendChild(el('tr', {}, [
+          el('td', {}, [productSelectFor_(entry)]),
+          el('td', { class: short ? 'short' : '' }, [txt(product ? (fmt(available) + ' ' + product.unit) : '-')]),
+          el('td', {}, [qtyInput]),
+          el('td', {}, [el('button', { class: 'btn ghost sm', onclick: () => { draft.splice(idx, 1); render(); } }, [txt('✕ ลบ')])])
         ]));
       });
       table.appendChild(tbody);
       card.appendChild(table);
+
+      card.appendChild(el('button', { class: 'btn ghost sm', style: 'margin-top:8px;', onclick: () => { draft.push({ code: '', qty: 1 }); render(); } }, [txt('+ เพิ่มรายการสินค้า')]));
 
       const actions = el('div', { class: 'fulfill-actions' }, [
         el('button', { class: 'btn success', onclick: () => releaseRequisition(req.id) }, [txt('✅ ยืนยันปล่อยของ')]),
@@ -980,6 +1022,111 @@
         ]));
       }
 
+      app.appendChild(card);
+    });
+  }
+
+  // ---------- "คำขอของฉัน" tab: a regular user reviews their own submitted
+  // withdrawals and can self-correct a still-pending one (fix a quantity or
+  // drop a wrong line) before an admin releases it. Cannot approve/release.
+  function myWithdrawals_() {
+    return history.filter(h => h.type === 'เบิกของ' && h.recordedBy === session.username)
+      .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
+  }
+  function statusLabel_(h) {
+    if (h.status === 'cancelled') return 'ยกเลิกแล้ว';
+    if (h.status === 'pending') return 'รอปล่อยของ';
+    return 'ปล่อยของแล้ว';
+  }
+
+  async function saveMyRequestEdit(reqId) {
+    const req = history.find(h => h.id === reqId);
+    if (!req || req.status !== 'pending') return;
+    const rows = document.querySelectorAll(`[data-myreq-row="${reqId}"]`);
+    const updatedItems = [];
+    rows.forEach(row => {
+      const code = row.getAttribute('data-code');
+      const input = row.querySelector('input');
+      const qty = Math.max(0, parseFloat(input.value) || 0);
+      const orig = (req.items || []).find(it => it.code === code);
+      if (!orig || qty <= 0) return; // 0 = drop this line
+      updatedItems.push({ ...orig, qty, subtotal: Math.round(qty * orig.price * 100) / 100 });
+    });
+    if (!updatedItems.length) { showToast('ต้องมีอย่างน้อย 1 รายการ ถ้าต้องการยกเลิกทั้งหมดให้กด "ยกเลิกคำขอทั้งหมด" แทน', true); return; }
+    const newTotal = Math.round(updatedItems.reduce((s, i) => s + i.subtotal, 0) * 100) / 100;
+    try {
+      if (apiAvailable) {
+        await apiUpdate('requisitions', reqId, { items: updatedItems, total: newTotal });
+        await refreshAll_(false);
+      } else {
+        const idx = history.findIndex(h => h.id === reqId);
+        if (idx > -1) history[idx] = { ...history[idx], items: updatedItems, total: newTotal };
+      }
+      showToast('บันทึกการแก้ไขแล้ว');
+    } catch (e) { console.error(e); showToast('บันทึกไม่สำเร็จ — ' + (e && e.message ? e.message : ''), true); }
+    render();
+  }
+
+  function renderMyRequests(app) {
+    const list = myWithdrawals_();
+    const headCard = el('div', { class: 'card' });
+    headCard.appendChild(el('div', { style: 'font-weight:800;font-size:.95rem;color:var(--navy);' }, [txt('คำขอเบิกของฉัน')]));
+    headCard.appendChild(el('div', { style: 'font-size:.8rem;color:var(--text-dim);margin-top:4px;' }, [
+      txt('ตรวจสอบรายการที่คุณเบิกไป รายการที่ยัง "รอปล่อยของ" แก้ไขจำนวนหรือยกเลิกได้เอง (แก้ไขไม่ได้แล้วหลังแอดมินปล่อยของ) — หน้านี้ดูได้อย่างเดียว ไม่สามารถกดปล่อยของเองได้')
+    ]));
+    app.appendChild(headCard);
+
+    if (!list.length) {
+      app.appendChild(el('div', { class: 'card' }, [el('div', { class: 'empty-note' }, [txt('คุณยังไม่มีประวัติการเบิกของ')])]));
+      return;
+    }
+
+    list.slice(0, 50).forEach(req => {
+      const card = el('div', { class: 'fulfill-card' });
+      card.appendChild(el('div', { class: 'fulfill-head' }, [
+        el('div', {}, [
+          el('div', { class: 'who' }, [txt(req.deptName || '-')]),
+          el('div', { class: 'meta' }, [txt(fmtDate(req.ts))])
+        ]),
+        el('div', { style: 'text-align:right;' }, [
+          el('span', { class: 'badge status-' + (req.status || 'fulfilled') }, [txt(statusLabel_(req))]),
+          el('div', { style: 'font-weight:800;color:var(--navy);margin-top:4px;' }, [txt(fmtMoney(req.total || 0) + ' บาท')])
+        ])
+      ]));
+
+      const pending = req.status === 'pending';
+      const table = el('table', { class: 'fulfill-items' });
+      table.appendChild(el('thead', {}, [el('tr', {}, [
+        el('th', {}, [txt('รายการสินค้า')]), el('th', {}, [txt('จำนวน')]),
+        pending ? el('th', {}, [txt('แก้ไขจำนวน (0 = ยกเลิกรายการนี้)')]) : el('th', {}, [])
+      ])]));
+      const tbody = el('tbody');
+      (req.items || []).forEach(it => {
+        if (pending) {
+          const input = el('input', { type: 'number', min: '0', step: '1', value: it.qty });
+          tbody.appendChild(el('tr', { 'data-myreq-row': req.id, 'data-code': it.code }, [
+            el('td', {}, [txt(it.name)]), el('td', {}, [txt(fmt(it.qty) + ' ' + it.unit)]), el('td', {}, [input])
+          ]));
+        } else {
+          tbody.appendChild(el('tr', {}, [el('td', {}, [txt(it.name)]), el('td', {}, [txt(fmt(it.qty) + ' ' + it.unit)]), el('td', {}, [])]));
+        }
+      });
+      table.appendChild(tbody);
+      card.appendChild(table);
+
+      if (pending) {
+        card.appendChild(el('div', { class: 'fulfill-actions' }, [
+          el('button', { class: 'btn success', onclick: () => saveMyRequestEdit(req.id) }, [txt('💾 บันทึกการแก้ไขจำนวน')]),
+          el('button', { class: 'btn ghost', onclick: () => { state.myReqConfirmCancel = state.myReqConfirmCancel === req.id ? null : req.id; render(); } }, [txt('✕ ยกเลิกคำขอทั้งหมด')])
+        ]));
+        if (state.myReqConfirmCancel === req.id) {
+          card.appendChild(el('div', { class: 'confirm-box' }, [
+            txt('ยืนยันยกเลิกคำขอเบิกนี้ทั้งหมดหรือไม่?'),
+            el('button', { class: 'btn danger sm', onclick: () => cancelRequisition(req.id) }, [txt('ยืนยันยกเลิก')]),
+            el('button', { class: 'btn ghost sm', onclick: () => { state.myReqConfirmCancel = null; render(); } }, [txt('ปิด')])
+          ]));
+        }
+      }
       app.appendChild(card);
     });
   }
@@ -1112,19 +1259,29 @@
           el('td', {}, [el('button', { class: 'btn ghost sm', onclick: (e) => { e.stopPropagation(); exportStockCountXLSX(sc); } }, [txt('⬇ Excel')])])
         ]));
         if (isExpanded) {
-          const changedItems = (sc.items || []).filter(it => it.diff !== 0);
+          // Full detail of every item counted in this session — not just the
+          // ones with a difference — so "ก่อนนับ" (system) vs "หลังนับ"
+          // (counted) is visible for the whole check, with differences
+          // highlighted for quick scanning.
+          const allItems = (sc.items || []).slice().sort((a, b) => a.name.localeCompare(b.name, 'th'));
           const sub = el('tr', { class: 'subrow' });
           const td = el('td', { colspan: '7' });
-          if (!changedItems.length) {
-            td.appendChild(el('div', { class: 'empty-note' }, [txt('ไม่พบผลต่างในการเช็คครั้งนี้ (ยอดตรงกับระบบทุกรายการ)')]));
+          if (!allItems.length) {
+            td.appendChild(el('div', { class: 'empty-note' }, [txt('ไม่มีรายละเอียดการนับในครั้งนี้')]));
           } else {
             const miniTable = el('table', { class: 'rep', style: 'margin:4px 0;' });
-            miniTable.appendChild(el('thead', {}, [el('tr', {}, [el('th', {}, [txt('สินค้า')]), el('th', {}, [txt('ระบบ')]), el('th', {}, [txt('นับจริง')]), el('th', {}, [txt('ผลต่าง')]), el('th', {}, [txt('มูลค่าผลต่าง')])])]));
+            miniTable.appendChild(el('thead', {}, [el('tr', {}, [
+              el('th', {}, [txt('สินค้า')]), el('th', {}, [txt('ยอดก่อนนับ (ระบบ)')]), el('th', {}, [txt('ยอดหลังนับ (นับจริง)')]),
+              el('th', {}, [txt('ผลต่าง')]), el('th', {}, [txt('มูลค่าผลต่าง')])
+            ])]));
             const miniBody = el('tbody');
-            changedItems.forEach(it => {
-              miniBody.appendChild(el('tr', {}, [
-                el('td', {}, [txt(it.name)]), el('td', { class: 'num' }, [txt(fmt(it.systemStock))]), el('td', { class: 'num' }, [txt(fmt(it.countedStock))]),
-                el('td', { class: 'num', style: it.diff < 0 ? 'color:var(--red);' : 'color:var(--success);' }, [txt((it.diff > 0 ? '+' : '') + fmt(it.diff))]),
+            allItems.forEach(it => {
+              const changed = it.diff !== 0;
+              miniBody.appendChild(el('tr', { style: changed ? 'background:rgba(230,162,0,.08);' : '' }, [
+                el('td', {}, [txt(it.name)]),
+                el('td', { class: 'num' }, [txt(fmt(it.systemStock) + ' ' + (it.unit || ''))]),
+                el('td', { class: 'num' }, [txt(fmt(it.countedStock) + ' ' + (it.unit || ''))]),
+                el('td', { class: 'num', style: it.diff < 0 ? 'color:var(--red);font-weight:700;' : (it.diff > 0 ? 'color:var(--success);font-weight:700;' : '') }, [txt((it.diff > 0 ? '+' : '') + fmt(it.diff))]),
                 el('td', { class: 'num' }, [txt(fmtMoney(it.diffValue) + ' บ.')])
               ]));
             });
