@@ -2332,3 +2332,15 @@
         const hash = await hashPassword(entry.username);
         const payload = { passwordHash: hash, role: 'user', displayName: entry.name };
         if (apiAvailable) { await apiSet('auth_users', entry.username, payload); }
+        else { const idx = authUsers.findIndex(u => u.username === entry.username); if (idx > -1) authUsers[idx] = { username: entry.username, ...payload }; else authUsers.push({ username: entry.username, ...payload }); }
+        if (existing) updated++; else created++;
+      } catch (e) { /* continue with the rest */ }
+    }
+    if (apiAvailable) await loadAuthUsers_();
+    showToast(`นำเข้าสำเร็จ: เพิ่มใหม่ ${created} คน, อัปเดต ${updated} คน` + (skippedAdmin ? `, ข้ามบัญชีแอดมิน ${skippedAdmin} คน` : ''));
+    render();
+  }
+
+  render();
+  initDb();
+})();
