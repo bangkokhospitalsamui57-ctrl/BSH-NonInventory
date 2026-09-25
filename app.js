@@ -254,8 +254,11 @@
     // Normalize: the backend's own row key comes back as `id` — the rest
     // of this app keys products by `code`, so make sure that's always set
     // (works whether the stored record already carried its own `code`
-    // field or not).
-    const list = rows.map(r => ({ ...r, code: r.code || r.id }));
+    // field or not). Always coerce to a string: if the product code looks
+    // like a number, Google Sheets stores/returns that cell as a JS number,
+    // and a strict `===` compare against a string code from the UI would
+    // otherwise silently fail to match.
+    const list = rows.map(r => ({ ...r, code: String(r.code || r.id) }));
     if (list.length) { list.sort((a, b) => a.name.localeCompare(b.name, 'th')); products = list; }
   }
   async function loadHistory_() {
@@ -266,7 +269,10 @@
   async function loadAuthUsers_() {
     const rows = await apiList('auth_users');
     // Same normalization as products: this app keys accounts by `username`.
-    authUsers = rows.map(r => ({ ...r, username: r.username || r.id }));
+    // Coerce to a string — an employee-ID username (all digits) comes back
+    // from Google Sheets as a JS number, and `===` against the string typed
+    // into the login form would otherwise fail even for a correct password.
+    authUsers = rows.map(r => ({ ...r, username: String(r.username || r.id) }));
   }
   async function loadStockCounts_() {
     const rows = await apiList('stock_counts');
