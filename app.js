@@ -264,7 +264,19 @@
     if (list.length) { list.sort((a, b) => a.name.localeCompare(b.name, 'th')); products = list; }
   }
   async function loadHistory_() {
-    const list = await apiList('requisitions');
+    const rows = await apiList('requisitions');
+    // Same numeric-vs-string issue as products/auth_users: an employee-ID
+    // field that looks like a number comes back from Google Sheets as a JS
+    // number. `recordedBy` is compared with `===` against session.username
+    // (always a string) to find "my own" requests, so it must be coerced
+    // here or that match silently fails even though the row saved fine.
+    const list = rows.map(r => ({
+      ...r,
+      recordedBy: r.recordedBy != null ? String(r.recordedBy) : r.recordedBy,
+      employeeId: r.employeeId != null ? String(r.employeeId) : r.employeeId,
+      fulfilledBy: r.fulfilledBy != null ? String(r.fulfilledBy) : r.fulfilledBy,
+      cancelledBy: r.cancelledBy != null ? String(r.cancelledBy) : r.cancelledBy
+    }));
     list.sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
     history = list.slice(0, 2000);
   }
@@ -2320,15 +2332,3 @@
         const hash = await hashPassword(entry.username);
         const payload = { passwordHash: hash, role: 'user', displayName: entry.name };
         if (apiAvailable) { await apiSet('auth_users', entry.username, payload); }
-        else { const idx = authUsers.findIndex(u => u.username === entry.username); if (idx > -1) authUsers[idx] = { username: entry.username, ...payload }; else authUsers.push({ username: entry.username, ...payload }); }
-        if (existing) updated++; else created++;
-      } catch (e) { /* continue with the rest */ }
-    }
-    if (apiAvailable) await loadAuthUsers_();
-    showToast(`นำเข้าสำเร็จ: เพิ่มใหม่ ${created} คน, อัปเดต ${updated} คน` + (skippedAdmin ? `, ข้ามบัญชีแอดมิน ${skippedAdmin} คน` : ''));
-    render();
-  }
-
-  render();
-  initDb();
-})();
